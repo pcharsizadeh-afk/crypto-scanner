@@ -1,0 +1,14 @@
+name: Crypto Scanner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run test
+        run: |
+          echo "GitHub Actions is working!"
+          echo "Crypto Scanner is ready."
