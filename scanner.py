@@ -1,13 +1,22 @@
 import requests
 from datetime import datetime, timezone
-from statistics import mean
 
 
 # ============================================================
-# OMPFinex Crypto Scanner - Version 1
+# CRYPTO FUTURES SCANNER - VERSION 2
+# OMPFinex
+#
 # Markets:
 # BTCUSDT / ETHUSDT / XRPUSDT / ADAUSDT / SOLUSDT
+#
+# 4H = Bias / Market Structure
+# 1H = Setup / Entry
+#
+# IMPORTANT:
+# This scanner does NOT place trades.
+# It only identifies candidate LONG / SHORT setups.
 # ============================================================
+
 
 BASE_URL = "https://api.ompfinex.com/v2/udf/real/history"
 
@@ -19,25 +28,22 @@ SYMBOLS = [
     "SOLUSDT",
 ]
 
-# Number of 1H candles requested
-CANDLE_COUNT = 1000
-
-# Swing detection
-SWING_LOOKBACK = 3
-
-# EMA
+LOOKBACK_HOURS = 1000
+SWING = 3
 EMA_PERIOD = 20
+
+MIN_SCORE = 75
+MIN_RR = 2.0
 
 
 # ============================================================
-# API
+# DATA
 # ============================================================
 
 def get_candles(symbol, resolution=60, hours=1000):
 
     now = int(datetime.now(timezone.utc).timestamp())
-
-    start = now - (hours * 60 * 60)
+    start = now - hours * 60 * 60
 
     params = {
         "symbol": symbol,
@@ -46,15 +52,15 @@ def get_candles(symbol, resolution=60, hours=1000):
         "resolution": resolution,
     }
 
-    response = requests.get(
+    r = requests.get(
         BASE_URL,
         params=params,
         timeout=30
     )
 
-    response.raise_for_status()
+    r.raise_for_status()
 
-    data = response.json()
+    data = r.json()
 
     if data.get("s") != "ok":
         raise Exception(f"{symbol}: {data}")
@@ -63,11 +69,11 @@ def get_candles(symbol, resolution=60, hours=1000):
 
     for key in required:
         if key not in data:
-            raise Exception(f"{symbol}: missing field {key}")
+            raise Exception(f"{symbol}: missing {key}")
 
     candles = []
 
-    length = min(
+    n = min(
         len(data["t"]),
         len(data["o"]),
         len(data["h"]),
@@ -76,7 +82,7 @@ def get_candles(symbol, resolution=60, hours=1000):
         len(data["v"])
     )
 
-    for i in range(length):
+    for i in range(n):
 
         candles.append({
             "time": int(data["t"][i]),
@@ -93,75 +99,52 @@ def get_candles(symbol, resolution=60, hours=1000):
 
 
 # ============================================================
-# EMA
+# 1H -> 4H
 # ============================================================
 
-def calculate_ema(values, period=20):
-
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    ema = mean(values[:period])
-
-    for price in values[period:]:
-        ema = (price - ema) * multiplier + ema
-
-    return ema
-
-
-# ============================================================
-# 1H -> 4H aggregation
-# ============================================================
-
-def aggregate_to_4h(candles):
-
-    if not candles:
-        return []
+def aggregate_4h(candles):
 
     result = []
-
     current = None
-    current_bucket = None
+    bucket_id = None
 
-    FOUR_HOURS = 4 * 60 * 60
+    bucket_size = 4 * 60 * 60
 
-    for candle in candles:
+    for c in candles:
 
-        bucket = (candle["time"] // FOUR_HOURS) * FOUR_HOURS
+        bucket = (c["time"] // bucket_size) * bucket_size
 
-        if current_bucket != bucket:
+        if bucket != bucket_id:
 
             if current is not None:
                 result.append(current)
 
-            current_bucket = bucket
+            bucket_id = bucket
 
             current = {
                 "time": bucket,
-                "open": candle["open"],
-                "high": candle["high"],
-                "low": candle["low"],
-                "close": candle["close"],
-                "volume": candle["volume"],
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+                "volume": c["volume"],
             }
 
         else:
 
             current["high"] = max(
                 current["high"],
-                candle["high"]
+                c["high"]
             )
 
             current["low"] = min(
                 current["low"],
-                candle["low"]
+                c["low"]
             )
 
-            current["close"] = candle["close"]
+            current["close"] = c["close"]
 
-            current["volume"] += candle["volume"]
+            current["volume"] += c["volume"]
 
     if current is not None:
         result.append(current)
@@ -170,246 +153,441 @@ def aggregate_to_4h(candles):
 
 
 # ============================================================
-# Swing High / Swing Low
+# EMA
 # ============================================================
 
-def find_swing_highs(candles, lookback=3):
+def ema(values, period=20):
 
-    swings = []
+    if len(values) < period:
+        return None
 
-    for i in range(
-        lookback,
-        len(candles) - lookback
-    ):
+    multiplier = 2 / (period + 1)
 
-        high = candles[i]["high"]
+    result = sum(values[:period]) / period
 
-        left = [
+    for value in values[period:]:
+        result = (
+            (value - result) * multiplier
+            + result
+        )
+
+    return result
+
+
+# ============================================================
+# SWINGS
+# ============================================================
+
+def swing_highs(candles):
+
+    result = []
+
+    for i in range(SWING, len(candles) - SWING):
+
+        h = candles[i]["high"]
+
+        left = max(
             candles[j]["high"]
-            for j in range(i - lookback, i)
-        ]
+            for j in range(i - SWING, i)
+        )
 
-        right = [
+        right = max(
             candles[j]["high"]
-            for j in range(i + 1, i + lookback + 1)
-        ]
+            for j in range(i + 1, i + SWING + 1)
+        )
 
-        if high > max(left) and high > max(right):
-            swings.append({
+        if h > left and h > right:
+
+            result.append({
                 "index": i,
-                "price": high,
+                "price": h,
                 "time": candles[i]["time"]
             })
 
-    return swings
+    return result
 
 
-def find_swing_lows(candles, lookback=3):
+def swing_lows(candles):
 
-    swings = []
+    result = []
 
-    for i in range(
-        lookback,
-        len(candles) - lookback
-    ):
+    for i in range(SWING, len(candles) - SWING):
 
-        low = candles[i]["low"]
+        l = candles[i]["low"]
 
-        left = [
+        left = min(
             candles[j]["low"]
-            for j in range(i - lookback, i)
-        ]
+            for j in range(i - SWING, i)
+        )
 
-        right = [
+        right = min(
             candles[j]["low"]
-            for j in range(i + 1, i + lookback + 1)
-        ]
+            for j in range(i + 1, i + SWING + 1)
+        )
 
-        if low < min(left) and low < min(right):
-            swings.append({
+        if l < left and l < right:
+
+            result.append({
                 "index": i,
-                "price": low,
+                "price": l,
                 "time": candles[i]["time"]
             })
 
-    return swings
+    return result
 
 
 # ============================================================
-# Market Structure
+# MARKET STRUCTURE
 # ============================================================
 
-def determine_structure(candles):
+def market_structure(candles):
 
-    if len(candles) < 30:
+    highs = swing_highs(candles)
+    lows = swing_lows(candles)
+
+    if len(highs) < 2 or len(lows) < 2:
+
         return {
-            "structure": "INSUFFICIENT_DATA",
-            "last_swing_high": None,
-            "previous_swing_high": None,
-            "last_swing_low": None,
-            "previous_swing_low": None,
+            "bias": "NEUTRAL",
+            "structure": "UNKNOWN",
+            "highs": highs,
+            "lows": lows,
         }
 
-    highs = find_swing_highs(
-        candles,
-        SWING_LOOKBACK
-    )
+    h1 = highs[-1]["price"]
+    h2 = highs[-2]["price"]
 
-    lows = find_swing_lows(
-        candles,
-        SWING_LOOKBACK
-    )
+    l1 = lows[-1]["price"]
+    l2 = lows[-2]["price"]
 
-    last_high = highs[-1] if highs else None
-    previous_high = highs[-2] if len(highs) >= 2 else None
+    if h1 > h2 and l1 > l2:
 
-    last_low = lows[-1] if lows else None
-    previous_low = lows[-2] if len(lows) >= 2 else None
+        structure = "BULLISH"
+        bias = "LONG"
 
-    structure = "RANGE"
+    elif h1 < h2 and l1 < l2:
 
-    if last_high and previous_high and last_low and previous_low:
+        structure = "BEARISH"
+        bias = "SHORT"
 
-        higher_high = (
-            last_high["price"] >
-            previous_high["price"]
-        )
+    else:
 
-        higher_low = (
-            last_low["price"] >
-            previous_low["price"]
-        )
-
-        lower_high = (
-            last_high["price"] <
-            previous_high["price"]
-        )
-
-        lower_low = (
-            last_low["price"] <
-            previous_low["price"]
-        )
-
-        if higher_high and higher_low:
-            structure = "BULLISH"
-
-        elif lower_high and lower_low:
-            structure = "BEARISH"
+        structure = "RANGE"
+        bias = "NEUTRAL"
 
     return {
+        "bias": bias,
         "structure": structure,
-        "last_swing_high": (
-            last_high["price"]
-            if last_high else None
-        ),
-        "previous_swing_high": (
-            previous_high["price"]
-            if previous_high else None
-        ),
-        "last_swing_low": (
-            last_low["price"]
-            if last_low else None
-        ),
-        "previous_swing_low": (
-            previous_low["price"]
-            if previous_low else None
-        ),
+        "highs": highs,
+        "lows": lows,
     }
 
 
 # ============================================================
-# Trend
+# BOS
 # ============================================================
 
-def determine_trend(candles):
+def detect_bos(candles, direction):
 
-    if len(candles) < EMA_PERIOD:
-        return "INSUFFICIENT_DATA"
+    if len(candles) < 20:
+        return False
 
-    closes = [
-        c["close"]
-        for c in candles
-    ]
+    recent = candles[-1]
 
-    ema20 = calculate_ema(
-        closes,
-        EMA_PERIOD
+    highs = swing_highs(candles[:-3])
+    lows = swing_lows(candles[:-3])
+
+    if direction == "LONG" and highs:
+
+        last_high = highs[-1]["price"]
+
+        if recent["close"] > last_high:
+            return True
+
+    if direction == "SHORT" and lows:
+
+        last_low = lows[-1]["price"]
+
+        if recent["close"] < last_low:
+            return True
+
+    return False
+
+
+# ============================================================
+# LIQUIDITY SWEEP
+# ============================================================
+
+def detect_liquidity_sweep(candles, direction):
+
+    if len(candles) < 15:
+        return False
+
+    recent = candles[-1]
+
+    highs = swing_highs(candles[:-2])
+    lows = swing_lows(candles[:-2])
+
+    if direction == "LONG" and lows:
+
+        liquidity = lows[-1]["price"]
+
+        swept = recent["low"] < liquidity
+        recovered = recent["close"] > liquidity
+
+        return swept and recovered
+
+    if direction == "SHORT" and highs:
+
+        liquidity = highs[-1]["price"]
+
+        swept = recent["high"] > liquidity
+        rejected = recent["close"] < liquidity
+
+        return swept and rejected
+
+    return False
+
+
+# ============================================================
+# MOMENTUM
+# ============================================================
+
+def bullish_candle(c):
+
+    return c["close"] > c["open"]
+
+
+def bearish_candle(c):
+
+    return c["close"] < c["open"]
+
+
+def momentum_confirmation(candles, direction):
+
+    if len(candles) < 5:
+        return False
+
+    recent = candles[-3:]
+
+    if direction == "LONG":
+
+        bullish = sum(
+            bullish_candle(c)
+            for c in recent
+        )
+
+        return bullish >= 2
+
+    if direction == "SHORT":
+
+        bearish = sum(
+            bearish_candle(c)
+            for c in recent
+        )
+
+        return bearish >= 2
+
+    return False
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(candles, period=14):
+
+    if len(candles) < period + 1:
+        return None
+
+    trs = []
+
+    for i in range(
+        len(candles) - period,
+        len(candles)
+    ):
+
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current["high"] - current["low"],
+            abs(
+                current["high"]
+                - previous["close"]
+            ),
+            abs(
+                current["low"]
+                - previous["close"]
+            )
+        )
+
+        trs.append(tr)
+
+    return sum(trs) / len(trs)
+
+
+# ============================================================
+# ENTRY / SL / TP
+# ============================================================
+
+def build_trade(candles, direction):
+
+    last = candles[-1]
+
+    entry = last["close"]
+
+    atr = calculate_atr(candles)
+
+    if atr is None:
+        return None
+
+    lows = swing_lows(candles[:-2])
+    highs = swing_highs(candles[:-2])
+
+    if direction == "LONG":
+
+        if not lows:
+            return None
+
+        swing_low = lows[-1]["price"]
+
+        sl = min(
+            swing_low,
+            entry - atr * 1.2
+        )
+
+        risk = entry - sl
+
+        if risk <= 0:
+            return None
+
+        tp1 = entry + risk * 2
+        tp2 = entry + risk * 3
+        tp3 = entry + risk * 4
+
+    else:
+
+        if not highs:
+            return None
+
+        swing_high = highs[-1]["price"]
+
+        sl = max(
+            swing_high,
+            entry + atr * 1.2
+        )
+
+        risk = sl - entry
+
+        if risk <= 0:
+            return None
+
+        tp1 = entry - risk * 2
+        tp2 = entry - risk * 3
+        tp3 = entry - risk * 4
+
+    rr = abs(tp2 - entry) / risk
+
+    return {
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rr": rr,
+        "atr": atr,
+    }
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+def calculate_score(
+    direction,
+    structure,
+    bos,
+    sweep,
+    momentum,
+    trend
+):
+
+    score = 0
+
+    if structure == direction:
+        score += 25
+
+    if bos:
+        score += 20
+
+    if sweep:
+        score += 20
+
+    if momentum:
+        score += 15
+
+    if trend == direction:
+        score += 20
+
+    return score
+
+
+# ============================================================
+# ANALYZE
+# ============================================================
+
+def analyze(symbol):
+
+    candles_1h = get_candles(
+        symbol,
+        resolution=60,
+        hours=LOOKBACK_HOURS
     )
 
-    last_close = closes[-1]
+    candles_4h = aggregate_4h(
+        candles_1h
+    )
 
-    if last_close > ema20:
-        return "ABOVE_EMA20"
+    if len(candles_4h) < 50:
 
-    if last_close < ema20:
-        return "BELOW_EMA20"
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": "INSUFFICIENT_4H_DATA"
+        }
 
-    return "AT_EMA20"
+    # -------------------------
+    # 4H
+    # -------------------------
 
+    structure_4h = market_structure(
+        candles_4h
+    )
 
-# ============================================================
-# Bias
-# ============================================================
+    bias = structure_4h["bias"]
 
-def determine_bias(structure, trend):
+    if bias == "NEUTRAL":
 
-    bullish_score = 0
-    bearish_score = 0
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": "4H_BIAS_NEUTRAL"
+        }
 
-    if structure == "BULLISH":
-        bullish_score += 2
+    direction = bias
 
-    elif structure == "BEARISH":
-        bearish_score += 2
-
-    if trend == "ABOVE_EMA20":
-        bullish_score += 1
-
-    elif trend == "BELOW_EMA20":
-        bearish_score += 1
-
-    if bullish_score >= 2 and bullish_score > bearish_score:
-        return "LONG_BIAS"
-
-    if bearish_score >= 2 and bearish_score > bullish_score:
-        return "SHORT_BIAS"
-
-    return "NEUTRAL"
-
-
-# ============================================================
-# Momentum
-# ============================================================
-
-def price_change(candles, periods):
-
-    if len(candles) <= periods:
-        return None
-
-    old_price = candles[-periods - 1]["close"]
-    new_price = candles[-1]["close"]
-
-    if old_price == 0:
-        return None
-
-    return ((new_price - old_price) / old_price) * 100
-
-
-# ============================================================
-# Setup Detection
-# ============================================================
-
-def detect_setup(bias, candles_1h):
-
-    if len(candles_1h) < 30:
-        return "WAIT"
+    # -------------------------
+    # 1H
+    # -------------------------
 
     closes = [
         c["close"]
         for c in candles_1h
     ]
 
-    ema20 = calculate_ema(
+    ema20 = ema(
         closes,
         EMA_PERIOD
     )
@@ -417,192 +595,219 @@ def detect_setup(bias, candles_1h):
     last = candles_1h[-1]
 
     if ema20 is None:
-        return "WAIT"
 
-    # Basic continuation setup.
-    # This is NOT yet the final trading strategy.
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": "NO_EMA"
+        }
 
-    if bias == "LONG_BIAS":
+    if direction == "LONG":
 
-        if last["close"] > ema20:
+        trend_ok = last["close"] > ema20
 
-            if last["close"] > last["open"]:
-                return "LONG_CANDIDATE"
+    else:
 
-    if bias == "SHORT_BIAS":
+        trend_ok = last["close"] < ema20
 
-        if last["close"] < ema20:
+    if not trend_ok:
 
-            if last["close"] < last["open"]:
-                return "SHORT_CANDIDATE"
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": "1H_NOT_ALIGNED"
+        }
 
-    return "WAIT"
+    # -------------------------
+    # Structure confirmation
+    # -------------------------
 
-
-# ============================================================
-# Analyze Symbol
-# ============================================================
-
-def analyze_symbol(symbol):
-
-    candles_1h = get_candles(
-        symbol,
-        resolution=60,
-        hours=CANDLE_COUNT
+    bos = detect_bos(
+        candles_1h,
+        direction
     )
 
-    if len(candles_1h) < 100:
-        raise Exception(
-            f"Not enough 1H candles: {len(candles_1h)}"
-        )
-
-    candles_4h = aggregate_to_4h(
-        candles_1h
+    sweep = detect_liquidity_sweep(
+        candles_1h,
+        direction
     )
 
-    structure_4h = determine_structure(
-        candles_4h
+    momentum = momentum_confirmation(
+        candles_1h,
+        direction
     )
 
-    trend_4h = determine_trend(
-        candles_4h
-    )
+    trend = direction
 
-    bias = determine_bias(
+    score = calculate_score(
+        direction,
         structure_4h["structure"],
-        trend_4h
+        bos,
+        sweep,
+        momentum,
+        trend
     )
 
-    trend_1h = determine_trend(
-        candles_1h
+    # -------------------------
+    # Trade
+    # -------------------------
+
+    trade = build_trade(
+        candles_1h,
+        direction
     )
 
-    setup = detect_setup(
-        bias,
-        candles_1h
-    )
+    if trade is None:
 
-    last = candles_1h[-1]
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": "TRADE_CALCULATION_FAILED"
+        }
+
+    if trade["rr"] < MIN_RR:
+
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": "RR_TOO_LOW"
+        }
+
+    if score < MIN_SCORE:
+
+        return {
+            "symbol": symbol,
+            "signal": None,
+            "reason": f"SCORE_{score}_BELOW_{MIN_SCORE}"
+        }
 
     return {
         "symbol": symbol,
-        "candles_1h": len(candles_1h),
-        "candles_4h": len(candles_4h),
-
-        "price": last["close"],
-
-        "4h_structure":
-            structure_4h["structure"],
-
-        "4h_trend":
-            trend_4h,
-
-        "4h_bias":
-            bias,
-
-        "1h_trend":
-            trend_1h,
-
-        "setup":
-            setup,
-
-        "last_swing_high":
-            structure_4h["last_swing_high"],
-
-        "last_swing_low":
-            structure_4h["last_swing_low"],
-
-        "change_1h":
-            price_change(candles_1h, 1),
-
-        "change_4h":
-            price_change(candles_1h, 4),
-
-        "change_24h":
-            price_change(candles_1h, 24),
+        "signal": direction,
+        "score": score,
+        "bias": bias,
+        "structure": structure_4h["structure"],
+        "bos": bos,
+        "liquidity_sweep": sweep,
+        "momentum": momentum,
+        "entry": trade["entry"],
+        "sl": trade["sl"],
+        "tp1": trade["tp1"],
+        "tp2": trade["tp2"],
+        "tp3": trade["tp3"],
+        "rr": trade["rr"],
     }
 
 
 # ============================================================
-# Main
+# OUTPUT
+# ============================================================
+
+def print_signal(result):
+
+    if result.get("signal") is None:
+
+        print(
+            f"[NO TRADE] "
+            f"{result['symbol']} | "
+            f"{result['reason']}"
+        )
+
+        return
+
+    print()
+    print("=" * 70)
+
+    if result["signal"] == "LONG":
+        print(f"🟢 LONG SIGNAL | {result['symbol']}")
+    else:
+        print(f"🔴 SHORT SIGNAL | {result['symbol']}")
+
+    print("=" * 70)
+
+    print(f"Bias : {result['bias']}")
+    print(f"Structure : {result['structure']}")
+    print(f"BOS : {result['bos']}")
+    print(f"Liquidity Sweep : {result['liquidity_sweep']}")
+    print(f"Momentum : {result['momentum']}")
+
+    print()
+    print(f"Entry : {result['entry']}")
+    print(f"Stop Loss : {result['sl']}")
+    print(f"TP1 : {result['tp1']}")
+    print(f"TP2 : {result['tp2']}")
+    print(f"TP3 : {result['tp3']}")
+
+    print()
+    print(f"Risk / Reward : 1:{result['rr']:.2f}")
+    print(f"Score : {result['score']}/100")
+
+    print("=" * 70)
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 def main():
 
+    print()
     print("=" * 70)
-    print("OMPFinex CRYPTO SCANNER - VERSION 1")
+    print("OMPFinex FUTURES SCANNER - VERSION 2")
     print("=" * 70)
 
     print()
-    print("Markets:")
+    print("Scanning:")
     print(", ".join(SYMBOLS))
 
     print()
-    print("Timeframes:")
-    print("4H = Market Bias")
-    print("1H = Setup Detection")
+    print("Rule:")
+    print("ONLY VALID LONG / SHORT SETUPS ARE SIGNALS")
+    print("NO TRADE RESULTS WILL NOT BE SENT TO TELEGRAM")
 
-    print()
-    print("=" * 70)
-
-    results = []
+    signals = []
 
     for symbol in SYMBOLS:
 
-        print()
-        print(f"Analyzing {symbol} ...")
-
         try:
 
-            result = analyze_symbol(symbol)
+            result = analyze(symbol)
 
-            results.append(result)
+            print_signal(result)
 
-            print(f"✓ {symbol}")
-            print(f"  Price       : {result['price']}")
-            print(f"  4H Structure: {result['4h_structure']}")
-            print(f"  4H Trend    : {result['4h_trend']}")
-            print(f"  4H Bias     : {result['4h_bias']}")
-            print(f"  1H Trend    : {result['1h_trend']}")
-            print(f"  Setup       : {result['setup']}")
+            if result.get("signal") in [
+                "LONG",
+                "SHORT"
+            ]:
 
-            if result["change_1h"] is not None:
-                print(
-                    f"  1H Change   : "
-                    f"{result['change_1h']:.2f}%"
-                )
-
-            if result["change_4h"] is not None:
-                print(
-                    f"  4H Change   : "
-                    f"{result['change_4h']:.2f}%"
-                )
-
-            if result["change_24h"] is not None:
-                print(
-                    f"  24H Change  : "
-                    f"{result['change_24h']:.2f}%"
-                )
+                signals.append(result)
 
         except Exception as e:
 
-            print(f"✗ {symbol}")
-            print(f"  ERROR: {e}")
+            print(
+                f"[ERROR] {symbol}: {e}"
+            )
 
     print()
     print("=" * 70)
-    print("SCAN SUMMARY")
+    print("FINAL SIGNALS")
     print("=" * 70)
 
-    for result in results:
+    if not signals:
 
-        print(
-            f"{result['symbol']:10} | "
-            f"{result['4h_bias']:12} | "
-            f"{result['setup']}"
-        )
+        print("NO VALID LONG/SHORT SETUP FOUND")
 
-    print()
+    else:
+
+        for signal in signals:
+
+            print(
+                f"{signal['symbol']} → "
+                f"{signal['signal']} | "
+                f"Score: {signal['score']}/100 | "
+                f"RR: 1:{signal['rr']:.2f}"
+            )
+
     print("=" * 70)
     print("SCAN FINISHED")
     print("=" * 70)
