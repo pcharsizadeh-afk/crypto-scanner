@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OMPFinex SIGNAL SCANNER - VERSION 9
-4H TREND -> 1H MULTI-SETUP TRIGGER | LONG/SHORT ONLY
+OMPFinex SIGNAL SCANNER - VERSION 10
+3H TREND -> 1H MULTI-SETUP TRIGGER | LONG/SHORT ONLY
 
 Purpose:
 - Scan up to 100 OMPFinex USDT crypto markets.
@@ -132,13 +132,31 @@ def manual_universe() -> list[str]:
 
 def fetch_history(
     symbol: str,
-    resolution: int,
+    resolution: int | str,
     bars: int = 300,
 ) -> list[Candle]:
-    """Fetch enough history for EMA200 and the 1H trigger logic."""
+    """Fetch OHLCV directly from an OMPFinex-supported resolution.
+
+    Supported resolutions used by this scanner:
+      60  = 1H
+      180 = 3H
+
+    4H/240 is intentionally never requested.
+    """
     now = int(time.time())
-    seconds = resolution * 60
-    start = now - seconds * max(bars + 80, 380)
+
+    if resolution == 60:
+        seconds = 60 * 60
+    elif resolution == 180:
+        seconds = 180 * 60
+    else:
+        raise ValueError(
+            f"Unsupported scanner resolution: {resolution!r}"
+        )
+
+    # Request more than needed for EMA200 and trigger calculations.
+    requested_bars = max(bars, 260)
+    start = now - seconds * (requested_bars + 40)
 
     candidates = []
     if SYMBOL_PREFIX:
@@ -161,18 +179,18 @@ def fetch_history(
 
             if not isinstance(data, dict):
                 last_error = RuntimeError(
-                    f"unexpected history response type: {type(data).__name__}"
+                    f"unexpected response type={type(data).__name__}"
                 )
                 continue
 
             status = str(data.get("s", "")).lower()
+
             if status != "ok":
-                # Keep the API's actual response so the next failure is
-                # diagnosable instead of ending with "None".
                 msg = data.get("errmsg") or data.get("error") or data.get("s")
                 last_error = RuntimeError(
-                    f"history status={status or 'missing'}"
-                    f" errmsg={msg!r} symbol={api_symbol!r}"
+                    f"API status={status or 'missing'} "
+                    f"errmsg={msg!r} symbol={api_symbol!r} "
+                    f"resolution={resolution!r}"
                 )
                 continue
 
@@ -184,12 +202,25 @@ def fetch_history(
                 data.get("v", []),
                 data.get("t", []),
             )
+
+            if any(not isinstance(a, list) for a in arrays):
+                last_error = RuntimeError(
+                    f"API returned non-list OHLCV arrays "
+                    f"symbol={api_symbol!r} resolution={resolution!r}"
+                )
+                continue
+
             n = min(map(len, arrays))
 
-            if n < 220:
+            if n < 30:
+                last_error = RuntimeError(
+                    f"too few candles={n} symbol={api_symbol!r} "
+                    f"resolution={resolution!r}"
+                )
                 continue
 
             candles: list[Candle] = []
+
             for i in range(n):
                 try:
                     candles.append(
@@ -202,19 +233,42 @@ def fetch_history(
                             float(arrays[4][i]),
                         )
                     )
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, IndexError):
                     continue
 
-            if len(candles) >= 220:
-                return candles[-bars:]
+            if len(candles) < 30:
+                last_error = RuntimeError(
+                    f"valid candles after parsing={len(candles)}"
+                )
+                continue
+
+            # Remove a still-forming final candle.
+            if (
+                candles[-1].ts + seconds
+                > int(time.time())
+            ):
+                candles = candles[:-1]
+
+            if len(candles) < 30:
+                last_error = RuntimeError(
+                    f"closed candles after removing current="
+                    f"{len(candles)}"
+                )
+                continue
+
+            return candles[-bars:]
 
         except Exception as exc:
             last_error = exc
 
-    raise RuntimeError(f"history unavailable for {symbol}: {last_error}")
+    raise RuntimeError(
+        f"history unavailable | symbol={symbol} | "
+        f"resolution={resolution} | reason={last_error}"
+    )
 
 
-def ema(values: list[float], period: int) -> list[float]:
+def ema(
+values: list[float], period: int) -> list[float]:
     if len(values) < period:
         return [math.nan] * len(values)
 
@@ -318,7 +372,7 @@ def context_4h(candles: list[Candle]) -> tuple[str, int, str]:
     e50 = ema(closes, EMA_CONTEXT_FAST)
     e200 = ema(closes, EMA_CONTEXT_SLOW)
 
-    idx = last_closed_index(candles, 240)
+    idx = last_closed_index(candles, 180)
 
     if (
         idx < 10
@@ -651,11 +705,11 @@ def trigger_1h(
 
 def scan_symbol(symbol: str) -> Optional[Signal]:
     try:
-        c4h = fetch_history(symbol, 240, 300)
-        direction, ctx_score, ctx_reason = context_4h(c4h)
+        c3h = fetch_history(symbol, 180, 300)
+        direction, ctx_score, ctx_reason = context_4h(c3h)
 
         print(
-            f"[SCAN] {symbol} | 4H={direction} | "
+            f"[SCAN] {symbol} | 3H={direction} | "
             f"CTX={ctx_score} | {ctx_reason}"
         )
 
@@ -741,10 +795,10 @@ def signal_message(sig: Signal) -> str:
     )
 
     return (
-        f"{icon} OMPFinex SIGNAL V9\n"
+        f"{icon} OMPFinex SIGNAL V10\n"
         f"#{sig.symbol}\n"
         f"Direction: {sig.direction}\n"
-        f"4H: {sig.context}\n"
+        f"3H: {sig.context}\n"
         f"Score: {sig.score}/100\n"
         f"Entry: {fmt_price(sig.entry)}\n"
         f"SL: {fmt_price(sig.sl)}\n"
@@ -761,8 +815,8 @@ def signal_message(sig: Signal) -> str:
 
 def main() -> None:
     print("=" * 78)
-    print("OMPFinex SIGNAL SCANNER - VERSION 9")
-    print("4H TREND -> 1H MULTI-SETUP TRIGGER | LONG/SHORT ONLY")
+    print("OMPFinex SIGNAL SCANNER - VERSION 10")
+    print("3H TREND -> 1H MULTI-SETUP TRIGGER | LONG/SHORT ONLY")
     print(
         f"Universe: up to {TARGET_SYMBOL_COUNT} USDT markets | "
         f"Trigger lookback: {LOOKBACK_TRIGGERS} closed 1H candles | "
