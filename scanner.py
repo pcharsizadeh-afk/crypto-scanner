@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OMPFinex SIGNAL SCANNER - VERSION 8
+OMPFinex SIGNAL SCANNER - VERSION 9
 4H TREND -> 1H MULTI-SETUP TRIGGER | LONG/SHORT ONLY
 
 Purpose:
@@ -96,207 +96,123 @@ def http_get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
 
 
 
-@dataclass(frozen=True)
-class Market:
-    ticker: str
-    symbol: str
-    name: str
-    exchange: str
+# ---------------------------------------------------------------------------
+# MANUAL UNIVERSE
+# ---------------------------------------------------------------------------
+# This list is intentionally fixed.  We do NOT discover symbols dynamically,
+# because the previous discovery path returned symbols that existed in the
+# exchange's spot/search feed but did not necessarily have usable OHLCV
+# history for this scanner.
+MANUAL_USDT_SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT",
+    "TRXUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","POLUSDT","LTCUSDT","BCHUSDT",
+    "UNIUSDT","ATOMUSDT","ETCUSDT","XLMUSDT","FILUSDT","APTUSDT","NEARUSDT",
+    "ARBUSDT","OPUSDT","AAVEUSDT","INJUSDT","SUIUSDT","SEIUSDT","TIAUSDT",
+    "PEPEUSDT","SHIBUSDT","HBARUSDT","ICPUSDT","MKRUSDT","ALGOUSDT","VETUSDT",
+    "EGLDUSDT","SANDUSDT","MANAUSDT","AXSUSDT","GALAUSDT","EOSUSDT","XTZUSDT",
+    "THETAUSDT","FLOWUSDT","QNTUSDT","SNXUSDT","CRVUSDT","COMPUSDT","LDOUSDT",
+    "RUNEUSDT","1INCHUSDT","ZRXUSDT","ENJUSDT","BATUSDT","CHZUSDT","DYDXUSDT",
+    "IMXUSDT","APEUSDT","GMTUSDT","WOOUSDT","CAKEUSDT","KAVAUSDT","KSMUSDT",
+    "MINAUSDT","ROSEUSDT","ONEUSDT","IOTAUSDT","NEOUSDT","QTUMUSDT","ONTUSDT",
+    "ZILUSDT","ICXUSDT","DASHUSDT","ZECUSDT","XMRUSDT","WAVESUSDT","YFIUSDT",
+    "SUSHIUSDT","BALUSDT","ENSUSDT","STXUSDT","RENDERUSDT","FETUSDT","OCEANUSDT",
+    "JASMYUSDT","MASKUSDT","WLDUSDT","BLURUSDT","ORDIUSDT","TONUSDT","NOTUSDT",
+    "PYTHUSDT","JUPUSDT","WIFUSDT","BONKUSDT","FLOKIUSDT","BOMEUSDT","ENAUSDT",
+    "EIGENUSDT","TAOUSDT",
+]
+
+assert len(MANUAL_USDT_SYMBOLS) == 100
+assert len(set(MANUAL_USDT_SYMBOLS)) == 100
 
 
-def _symbol_variants(m: Market) -> list[str]:
-    """Return the most common UDF symbol spellings used by OMPFinex."""
-    raw = [m.symbol, m.ticker]
-    out: list[str] = []
-
-    for x in raw:
-        x = str(x or "").strip()
-        if not x:
-            continue
-
-        variants = [x]
-        if x.upper().endswith("USDT"):
-            base = x[:-4]
-            variants += [f"{base}-USDT"]
-
-        for v in variants:
-            out.extend([
-                f"{SYMBOL_PREFIX}{v}" if SYMBOL_PREFIX else v,
-                v,
-            ])
-
-    # Preserve order and remove duplicates.
-    return list(dict.fromkeys(out))
-
-
-def discover_usdt_markets(target: int = TARGET_SYMBOL_COUNT) -> list[Market]:
-    """
-    Discover markets from OMPFinex search.
-
-    Important: the search endpoint is metadata only.  A symbol is not
-    considered scan-ready until its candle endpoint proves that history
-    exists.  This prevents the V8 failure mode where 100 metadata symbols
-    are found but none can be charted.
-    """
-    found: dict[str, Market] = {}
-
-    queries = ["USDT"]
-    queries += [f"{chr(65+i)}USDT" for i in range(26)]
-    queries += [chr(65+i) for i in range(26)]
-
-    for q in queries:
-        try:
-            data = http_get(
-                "/v2/udf/real/search",
-                {"query": q, "limit": 50},
-            )
-        except Exception as exc:
-            print(f"[DISCOVERY ERROR] query={q} | {exc}")
-            continue
-
-        if not isinstance(data, list):
-            continue
-
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-
-            ticker = str(item.get("ticker") or "").upper().strip()
-            symbol = str(item.get("symbol") or "").upper().strip()
-            name = str(item.get("name") or item.get("full_name") or symbol)
-            exchange = str(item.get("exchange") or "")
-
-            key = ticker or symbol
-            if (
-                not key.endswith("USDT")
-                or not key.isalnum()
-                or str(item.get("type") or "").lower() not in ("", "crypto")
-                or (exchange and "ompfinex" not in exchange.lower())
-            ):
-                continue
-
-            found[key] = Market(
-                ticker=ticker or symbol,
-                symbol=symbol or ticker,
-                name=name,
-                exchange=exchange,
-            )
-
-            if len(found) >= target * 2:
-                break
-
-        if len(found) >= target * 2:
-            break
-
-    return list(found.values())
-
-
-def _history_request(api_symbol: str, resolution: int, bars: int) -> tuple[Any, str]:
-    now = int(time.time())
-    seconds = resolution * 60
-
-    # Ask for only what is actually needed.  Some UDF implementations
-    # silently cap very large requests; V8 treated that as "None".
-    start = now - seconds * (bars + 20)
-
-    try:
-        data = http_get(
-            "/v2/udf/real/history",
-            {
-                "symbol": api_symbol,
-                "from": start,
-                "to": now,
-                "resolution": resolution,
-            },
-        )
-        return data, ""
-    except Exception as exc:
-        return None, str(exc)
+def manual_universe() -> list[str]:
+    """Return the fixed 100-symbol universe in deterministic order."""
+    return list(MANUAL_USDT_SYMBOLS)
 
 
 def fetch_history(
-    market: Market,
+    symbol: str,
     resolution: int,
     bars: int = 300,
 ) -> list[Candle]:
-    """
-    Fetch OHLCV history with multiple OMPFinex symbol spellings.
+    """Fetch enough history for EMA200 and the 1H trigger logic."""
+    now = int(time.time())
+    seconds = resolution * 60
+    start = now - seconds * max(bars + 80, 380)
 
-    The old V8 code only tried two spellings and also rejected any response
-    with fewer than 220 candles.  That combination can turn a perfectly valid
-    market into 'history unavailable: None'.  This version reports the
-    actual UDF status and accepts the minimum history needed by the caller.
-    """
-    min_bars = 210 if resolution == 240 else 80
-    last_detail = "no response"
+    candidates = []
+    if SYMBOL_PREFIX:
+        candidates.append(f"{SYMBOL_PREFIX}{symbol}")
+    candidates.append(symbol)
 
-    for api_symbol in _symbol_variants(market):
-        data, error = _history_request(api_symbol, resolution, bars)
+    last_error: Optional[Exception] = None
 
-        if error:
-            last_detail = f"{api_symbol}: {error}"
-            continue
-
-        if not isinstance(data, dict):
-            last_detail = f"{api_symbol}: non-dict response"
-            continue
-
-        status = str(data.get("s") or "").lower()
-        if status != "ok":
-            last_detail = (
-                f"{api_symbol}: s={data.get('s')!r} "
-                f"errmsg={data.get('errmsg')!r} "
-                f"nextTime={data.get('nextTime')!r}"
-            )
-            continue
-
-        arrays = (
-            data.get("o", []),
-            data.get("h", []),
-            data.get("l", []),
-            data.get("c", []),
-            data.get("v", []),
-            data.get("t", []),
-        )
-
+    for api_symbol in candidates:
         try:
-            n = min(len(a) for a in arrays)
-        except ValueError:
-            n = 0
-
-        if n < min_bars:
-            last_detail = (
-                f"{api_symbol}: s=ok but only {n} bars "
-                f"(need >= {min_bars})"
+            data = http_get(
+                "/v2/udf/real/history",
+                {
+                    "symbol": api_symbol,
+                    "from": start,
+                    "to": now,
+                    "resolution": resolution,
+                },
             )
-            continue
 
-        candles: list[Candle] = []
-        for i in range(n):
-            try:
-                candles.append(
-                    Candle(
-                        int(arrays[5][i]),
-                        float(arrays[0][i]),
-                        float(arrays[1][i]),
-                        float(arrays[2][i]),
-                        float(arrays[3][i]),
-                        float(arrays[4][i]),
-                    )
+            if not isinstance(data, dict):
+                last_error = RuntimeError(
+                    f"unexpected history response type: {type(data).__name__}"
                 )
-            except (TypeError, ValueError, IndexError):
                 continue
 
-        if len(candles) >= min_bars:
-            return candles[-bars:]
+            status = str(data.get("s", "")).lower()
+            if status != "ok":
+                # Keep the API's actual response so the next failure is
+                # diagnosable instead of ending with "None".
+                msg = data.get("errmsg") or data.get("error") or data.get("s")
+                last_error = RuntimeError(
+                    f"history status={status or 'missing'}"
+                    f" errmsg={msg!r} symbol={api_symbol!r}"
+                )
+                continue
 
-        last_detail = (
-            f"{api_symbol}: parsed only {len(candles)} usable bars"
-        )
+            arrays = (
+                data.get("o", []),
+                data.get("h", []),
+                data.get("l", []),
+                data.get("c", []),
+                data.get("v", []),
+                data.get("t", []),
+            )
+            n = min(map(len, arrays))
 
-    raise RuntimeError(
-        f"history unavailable for {market.ticker}: {last_detail}"
-    )
+            if n < 220:
+                continue
+
+            candles: list[Candle] = []
+            for i in range(n):
+                try:
+                    candles.append(
+                        Candle(
+                            int(arrays[5][i]),
+                            float(arrays[0][i]),
+                            float(arrays[1][i]),
+                            float(arrays[2][i]),
+                            float(arrays[3][i]),
+                            float(arrays[4][i]),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+            if len(candles) >= 220:
+                return candles[-bars:]
+
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"history unavailable for {symbol}: {last_error}")
+
 
 def ema(values: list[float], period: int) -> list[float]:
     if len(values) < period:
@@ -733,13 +649,9 @@ def trigger_1h(
     return candidates[0]
 
 
-
-def scan_symbol(market: Market) -> Optional[Signal]:
-    symbol = market.ticker
-
+def scan_symbol(symbol: str) -> Optional[Signal]:
     try:
-        # 4H context needs enough history for EMA200.
-        c4h = fetch_history(market, 240, 240)
+        c4h = fetch_history(symbol, 240, 300)
         direction, ctx_score, ctx_reason = context_4h(c4h)
 
         print(
@@ -751,8 +663,7 @@ def scan_symbol(market: Market) -> Optional[Signal]:
             print(f"[FILTERED] {symbol} | NO_4H_DIRECTION")
             return None
 
-        # 1H trigger only needs ~80+ candles for EMA21/RSI/ATR.
-        c1h = fetch_history(market, 60, 180)
+        c1h = fetch_history(symbol, 60, 300)
         sig = trigger_1h(
             c1h,
             direction,
@@ -785,6 +696,7 @@ def scan_symbol(market: Market) -> Optional[Signal]:
     except Exception as exc:
         print(f"[ERROR] {symbol} | {exc}")
         return None
+
 
 def fmt_price(x: float) -> str:
     if x >= 1000:
@@ -829,7 +741,7 @@ def signal_message(sig: Signal) -> str:
     )
 
     return (
-        f"{icon} OMPFinex SIGNAL V8\n"
+        f"{icon} OMPFinex SIGNAL V9\n"
         f"#{sig.symbol}\n"
         f"Direction: {sig.direction}\n"
         f"4H: {sig.context}\n"
@@ -849,7 +761,7 @@ def signal_message(sig: Signal) -> str:
 
 def main() -> None:
     print("=" * 78)
-    print("OMPFinex SIGNAL SCANNER - VERSION 8")
+    print("OMPFinex SIGNAL SCANNER - VERSION 9")
     print("4H TREND -> 1H MULTI-SETUP TRIGGER | LONG/SHORT ONLY")
     print(
         f"Universe: up to {TARGET_SYMBOL_COUNT} USDT markets | "
@@ -858,36 +770,22 @@ def main() -> None:
     )
     print("=" * 78)
 
-    print(
-        f"[DISCOVERY] Target symbols: {TARGET_SYMBOL_COUNT}"
-    )
-
-    markets = discover_usdt_markets(TARGET_SYMBOL_COUNT)
-
-    if not markets:
-        print("[FATAL] No USDT markets discovered.")
-        return
+    symbols = manual_universe()
 
     print(
-        f"[DISCOVERY] Found {len(markets)} metadata candidates; "
-        f"history will be validated during scan."
+        f"[UNIVERSE] Fixed manual universe: {len(symbols)} USDT symbols"
     )
+    print("[UNIVERSE] " + ", ".join(symbols))
 
     signals: list[Signal] = []
 
-    # Scan more than the target if discovery returned extras; this allows
-    # invalid/delisted metadata entries to be skipped while still reaching
-    # the requested number of usable markets.
-    for i, market in enumerate(markets, 1):
-        if i > TARGET_SYMBOL_COUNT:
-            break
-
+    for i, symbol in enumerate(symbols, 1):
         print(
-            f"\n[{i}/{min(len(markets), TARGET_SYMBOL_COUNT)}] "
+            f"\n[{i}/{len(symbols)}] "
             + "-" * 50
         )
 
-        sig = scan_symbol(market)
+        sig = scan_symbol(symbol)
         if sig is not None:
             signals.append(sig)
 
@@ -931,7 +829,7 @@ def main() -> None:
 
     print("=" * 78)
     print(
-        f"SCAN FINISHED | symbols={min(len(markets), TARGET_SYMBOL_COUNT)} | "
+        f"SCAN FINISHED | symbols={len(symbols)} | "
         f"signals={len(signals)}"
     )
 
