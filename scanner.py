@@ -1,140 +1,236 @@
+#!/usr/bin/env python3
+"""
+OMPFinex SIGNAL SCANNER - VERSION 7
+4H TREND -> 1H TRIGGER | LONG/SHORT ONLY
+Dynamic universe: up to 100 USDT crypto markets discovered from OMPFinex.
+
+This version keeps the signal philosophy of V6 but removes the fixed 5-symbol list.
+It discovers OMPFinex USDT symbols through the official UDF search API, validates
+them with candle data, then scans up to 100 symbols.
+
+Environment variables:
+  OMPFINEX_BASE_URL      default: https://api.ompfinex.com
+  OMPFINEX_SYMBOL_PREFIX default: OMPFinex:
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID
+
+No orders are placed. Telegram receives only qualified LONG/SHORT signals.
+"""
+
+from __future__ import annotations
+
 import os
+import time
 import math
-import requests
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, Optional
 
-# ============================================================
-# OMPFinex Signal Scanner V6
-# Read-only: fetches candles and sends Telegram alerts.
-# It NEVER places an exchange order.
-# ============================================================
-
-BASE_URL = "https://api.ompfinex.com/v2/udf/real/history"
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "XRPUSDT", "ADAUSDT", "SOLUSDT"]
-
-LOOKBACK_HOURS = 720
-MIN_SCORE = 60
-MIN_RR = 2.0
-MAX_DISTANCE_FROM_EMA20_ATR = 1.8
-ATR_STOP_BUFFER = 0.20
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "OMPFinex-Scanner/6.0"})
+import requests
 
 
-def get_candles(symbol, resolution, hours):
-    now = int(datetime.now(timezone.utc).timestamp())
-    start = now - hours * 3600
+BASE_URL = os.getenv("OMPFINEX_BASE_URL", "https://api.ompfinex.com").rstrip("/")
+SYMBOL_PREFIX = os.getenv("OMPFINEX_SYMBOL_PREFIX", "OMPFinex:")
+TARGET_SYMBOL_COUNT = int(os.getenv("SCAN_SYMBOL_COUNT", "100"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15"))
+DISCOVERY_WORKERS = int(os.getenv("DISCOVERY_WORKERS", "6"))
 
-    r = SESSION.get(
-        BASE_URL,
-        params={
-            "symbol": symbol,
-            "from": start,
-            "to": now,
-            "resolution": resolution,
-        },
-        timeout=30,
-    )
+# V6-style thresholds.
+MIN_SIGNAL_SCORE = 65
+ATR_PERIOD = 14
+RSI_PERIOD = 14
+EMA_FAST = 9
+EMA_SLOW = 21
+EMA_CONTEXT_FAST = 50
+EMA_CONTEXT_SLOW = 200
+REL_VOL_PERIOD = 20
+
+session = requests.Session()
+session.headers.update({"User-Agent": "OMPFinex-Signal-Scanner/7.0"})
+
+
+@dataclass
+class Candle:
+    ts: int
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
+
+
+@dataclass
+class Signal:
+    symbol: str
+    direction: str
+    score: int
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    rr: float
+    rsi: float
+    rel_volume: float
+    context: str
+    setup: list[str]
+    candle_ts: int
+
+
+def http_get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
+    url = f"{BASE_URL}{path}"
+    r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-    data = r.json()
-
-    if data.get("s") != "ok":
-        raise RuntimeError(f"{symbol}/{resolution}: {data}")
-
-    keys = ("t", "o", "h", "l", "c", "v")
-    if any(k not in data for k in keys):
-        raise RuntimeError(f"{symbol}/{resolution}: incomplete API response")
-
-    n = min(len(data[k]) for k in keys)
-    out = []
-
-    for i in range(n):
-        out.append({
-            "time": int(data["t"][i]),
-            "open": float(data["o"][i]),
-            "high": float(data["h"][i]),
-            "low": float(data["l"][i]),
-            "close": float(data["c"][i]),
-            "volume": float(data["v"][i]),
-        })
-
-    out.sort(key=lambda x: x["time"])
-
-    # Deduplicate timestamps.
-    unique = {}
-    for c in out:
-        unique[c["time"]] = c
-    out = [unique[t] for t in sorted(unique)]
-
-    # Remove the currently forming candle.
-    bucket_seconds = resolution * 60
-    current_bucket = (
-        int(datetime.now(timezone.utc).timestamp()) // bucket_seconds
-    ) * bucket_seconds
-
-    return [c for c in out if c["time"] < current_bucket]
+    return r.json()
 
 
-def aggregate_4h(candles_1h):
-    groups = {}
+def discover_usdt_symbols(target: int = TARGET_SYMBOL_COUNT) -> list[str]:
+    """
+    OMPFinex's documented search endpoint accepts a query and max limit 50.
+    To avoid depending on an undocumented pagination parameter, query several
+    USDT prefixes and deduplicate. We then validate each symbol with history.
+    """
+    found: set[str] = set()
 
-    for c in candles_1h:
-        bucket = (c["time"] // 14400) * 14400
+    queries = ["USDT"]
+    queries += [f"{chr(65+i)}USDT" for i in range(26)]
+    queries += [f"{chr(65+i)}" for i in range(26)]
 
-        if bucket not in groups:
-            groups[bucket] = {
-                "time": bucket,
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": c["volume"],
-                "count": 1,
-            }
-        else:
-            g = groups[bucket]
-            g["high"] = max(g["high"], c["high"])
-            g["low"] = min(g["low"], c["low"])
-            g["close"] = c["close"]
-            g["volume"] += c["volume"]
-            g["count"] += 1
+    for q in queries:
+        try:
+            data = http_get(
+                "/v2/udf/real/search",
+                {"query": q, "limit": 50},
+            )
+        except Exception as exc:
+            print(f"[DISCOVERY ERROR] query={q} | {exc}")
+            continue
 
-    return [
-        {k: g[k] for k in
-         ("time", "open", "high", "low", "close", "volume")}
-        for g in sorted(groups.values(), key=lambda x: x["time"])
-        if g["count"] == 4
-    ]
+        if not isinstance(data, list):
+            continue
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("ticker") or item.get("symbol") or "").upper().strip()
+            typ = str(item.get("type") or "").lower()
+            exchange = str(item.get("exchange") or "").lower()
+
+            if (
+                symbol.endswith("USDT")
+                and symbol.isalnum()
+                and typ in ("", "crypto")
+                and (not exchange or "ompfinex" in exchange)
+            ):
+                found.add(symbol)
+
+        if len(found) >= target * 2:
+            break
+
+    # Stable order makes runs reproducible. We intentionally do not claim
+    # alphabetical order means "best"; this is the exchange-listed universe.
+    return sorted(found)[:target]
 
 
-def ema(values, period):
+def fetch_history(symbol: str, resolution: int, bars: int = 260) -> list[Candle]:
+    """
+    Fetch enough candles for EMA-200/context plus trigger indicators.
+    OMPFinex documents UDF history as a public endpoint. Different deployments
+    may accept a prefixed or plain symbol, so try the configured prefix first
+    and then the plain ticker.
+    """
+    now = int(time.time())
+    # Extra lookback gives the endpoint room to return a full EMA-200 window.
+    seconds = resolution * 60
+    start = now - seconds * max(bars + 50, 320)
+
+    candidates = []
+    if SYMBOL_PREFIX:
+        candidates.append(f"{SYMBOL_PREFIX}{symbol}")
+    candidates.append(symbol)
+
+    last_error = None
+
+    for api_symbol in candidates:
+        try:
+            data = http_get(
+                "/v2/udf/real/history",
+                {
+                    "symbol": api_symbol,
+                    "from": start,
+                    "to": now,
+                    "resolution": resolution,
+                },
+            )
+
+            if not isinstance(data, dict):
+                continue
+            if data.get("s") != "ok":
+                continue
+
+            o, h, l, c, v, t = (
+                data.get("o", []),
+                data.get("h", []),
+                data.get("l", []),
+                data.get("c", []),
+                data.get("v", []),
+                data.get("t", []),
+            )
+
+            n = min(len(o), len(h), len(l), len(c), len(v), len(t))
+            if n < 220:
+                continue
+
+            candles = []
+            for i in range(n):
+                try:
+                    candles.append(
+                        Candle(
+                            int(t[i]),
+                            float(o[i]),
+                            float(h[i]),
+                            float(l[i]),
+                            float(c[i]),
+                            float(v[i]),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            if len(candles) >= 220:
+                return candles[-bars:]
+
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f"history unavailable for {symbol}: {last_error}")
+
+
+def ema(values: list[float], period: int) -> list[float]:
     if len(values) < period:
-        return None
+        return [math.nan] * len(values)
 
-    value = sum(values[:period]) / period
-    alpha = 2 / (period + 1)
+    out = [math.nan] * (period - 1)
+    seed = sum(values[:period]) / period
+    out.append(seed)
+    alpha = 2.0 / (period + 1)
 
+    prev = seed
     for x in values[period:]:
-        value = alpha * x + (1 - alpha) * value
+        prev = alpha * x + (1 - alpha) * prev
+        out.append(prev)
+    return out
 
-    return value
 
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
+def rsi(values: list[float], period: int = RSI_PERIOD) -> float:
+    if len(values) <= period:
+        return math.nan
 
     gains = []
     losses = []
-
     for i in range(1, len(values)):
         d = values[i] - values[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -145,430 +241,300 @@ def rsi(values, period=14):
 
     if avg_loss == 0:
         return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
-    return 100 - (100 / (1 + avg_gain / avg_loss))
 
-
-def atr(candles, period=14):
+def atr(candles: list[Candle], period: int = ATR_PERIOD) -> float:
     if len(candles) < period + 1:
-        return None
+        return math.nan
 
     trs = []
-    start = len(candles) - period
+    for i in range(1, len(candles)):
+        prev = candles[i - 1].c
+        cur = candles[i]
+        trs.append(max(cur.h - cur.l, abs(cur.h - prev), abs(cur.l - prev)))
 
-    for i in range(start, len(candles)):
-        c = candles[i]
-        p = candles[i - 1]
-
-        trs.append(max(
-            c["high"] - c["low"],
-            abs(c["high"] - p["close"]),
-            abs(c["low"] - p["close"]),
-        ))
-
-    return sum(trs) / len(trs)
+    return sum(trs[-period:]) / period
 
 
-def avg_volume(candles, period=20):
-    if len(candles) < period:
+def last_closed_index(candles: list[Candle], resolution_minutes: int) -> int:
+    """
+    Avoid using a still-forming candle. If the newest candle is not closed,
+    use the previous candle.
+    """
+    if not candles:
+        return -1
+    now = int(time.time())
+    idx = len(candles) - 1
+    if now < candles[idx].ts + resolution_minutes * 60:
+        idx -= 1
+    return idx
+
+
+def context_4h(candles: list[Candle]) -> tuple[str, int, str]:
+    closes = [x.c for x in candles]
+    e50 = ema(closes, EMA_CONTEXT_FAST)
+    e200 = ema(closes, EMA_CONTEXT_SLOW)
+
+    idx = last_closed_index(candles, 240)
+    if idx < 2 or math.isnan(e50[idx]) or math.isnan(e200[idx]):
+        return "NEUTRAL", 0, "INSUFFICIENT_CONTEXT"
+
+    # Require both EMA structure and recent slope.
+    slope50 = e50[idx] - e50[max(0, idx - 5)]
+    slope200 = e200[idx] - e200[max(0, idx - 5)]
+    close = closes[idx]
+
+    bullish = close > e50[idx] > e200[idx] and slope50 > 0 and slope200 >= 0
+    bearish = close < e50[idx] < e200[idx] and slope50 < 0 and slope200 <= 0
+
+    if bullish:
+        return "LONG", 35, "4H_UPTREND"
+    if bearish:
+        return "SHORT", 35, "4H_DOWNTREND"
+    return "NEUTRAL", 0, "4H_MIXED"
+
+
+def trigger_1h(candles: list[Candle], direction: str, context_score: int) -> Optional[Signal]:
+    idx = last_closed_index(candles, 60)
+    if idx < 30:
         return None
-    return sum(c["volume"] for c in candles[-period:]) / period
 
+    c = candles[: idx + 1]
+    closes = [x.c for x in c]
+    highs = [x.h for x in c]
+    lows = [x.l for x in c]
+    volumes = [x.v for x in c]
 
-def trend_context(c4):
-    closes = [c["close"] for c in c4]
+    e9 = ema(closes, EMA_FAST)
+    e21 = ema(closes, EMA_SLOW)
+    r = rsi(closes)
+    a = atr(c)
+    if any(math.isnan(x) for x in (e9[-1], e21[-1], r, a)) or a <= 0:
+        return None
 
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    e20_prev = ema(closes[:-3], 20)
-    e50_prev = ema(closes[:-3], 50)
+    recent_vol = volumes[-1]
+    base_vols = volumes[-REL_VOL_PERIOD-1:-1]
+    avg_vol = sum(base_vols) / len(base_vols) if base_vols else 0
+    rel_vol = recent_vol / avg_vol if avg_vol > 0 else 0
 
-    if None in (e20, e50, e20_prev, e50_prev):
-        return {"side": "NEUTRAL", "score": 0, "reason": "INSUFFICIENT_4H_DATA"}
+    cur = c[-1]
+    prev = c[-2]
+    recent_high = max(highs[-6:-1])
+    recent_low = min(lows[-6:-1])
 
-    price = closes[-1]
-    slope20 = e20 - e20_prev
-    slope50 = e50 - e50_prev
+    score = context_score
+    setup = []
 
-    if price > e20 > e50 and slope20 > 0 and slope50 >= 0:
-        score = 35
-        reason = "4H_UPTREND"
-        side = "LONG"
-    elif price < e20 < e50 and slope20 < 0 and slope50 <= 0:
-        score = 35
-        reason = "4H_DOWNTREND"
-        side = "SHORT"
-    elif price > e50 and e20 > e50:
-        score = 25
-        reason = "4H_BULLISH_BIAS"
-        side = "LONG"
-    elif price < e50 and e20 < e50:
-        score = 25
-        reason = "4H_BEARISH_BIAS"
-        side = "SHORT"
-    else:
-        return {"side": "NEUTRAL", "score": 0, "reason": "4H_MIXED"}
+    if direction == "LONG":
+        if e9[-1] > e21[-1]:
+            score += 15
+            setup.append("1H_EMA_ALIGNMENT")
 
-    # Penalize an exhausted 4H move rather than blindly chasing it.
-    a = atr(c4)
-    if a and abs(price - e20) > 2.5 * a:
-        score -= 10
-        reason += "_EXTENDED"
-
-    return {"side": side, "score": max(score, 0), "reason": reason}
-
-
-def candle_quality(c):
-    rng = c["high"] - c["low"]
-    if rng <= 0:
-        return 0, False, False
-
-    body = abs(c["close"] - c["open"])
-    ratio = body / rng
-
-    bull = (
-        c["close"] > c["open"]
-        and ratio >= 0.45
-        and c["close"] >= c["low"] + 0.60 * rng
-    )
-    bear = (
-        c["close"] < c["open"]
-        and ratio >= 0.45
-        and c["close"] <= c["high"] - 0.60 * rng
-    )
-
-    return ratio, bull, bear
-
-
-def build_signal(c1, context):
-    side = context["side"]
-
-    if side == "NEUTRAL" or len(c1) < 80:
-        return None, "NO_4H_DIRECTION"
-
-    closes = [c["close"] for c in c1]
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    r = rsi(closes, 14)
-    a = atr(c1, 14)
-
-    if None in (e20, e50, r, a) or a <= 0:
-        return None, "INDICATORS_UNAVAILABLE"
-
-    last = c1[-1]
-    prev = c1[-2]
-    prior = c1[-21:-1]
-
-    resistance = max(c["high"] for c in prior)
-    support = min(c["low"] for c in prior)
-
-    body_ratio, bull, bear = candle_quality(last)
-
-    avol = avg_volume(c1[-21:], 20)
-    relvol = (last["volume"] / avol) if avol and avol > 0 else 0
-
-    score = context["score"]
-    reasons = []
-
-    # Trend alignment on 1H.
-    if side == "LONG" and last["close"] > e20 > e50:
-        score += 10
-        reasons.append("1H_EMA_ALIGNMENT")
-    elif side == "SHORT" and last["close"] < e20 < e50:
-        score += 10
-        reasons.append("1H_EMA_ALIGNMENT")
-
-    # Breakout / breakdown.
-    breakout = last["close"] > resistance
-    breakdown = last["close"] < support
-
-    # Sweep and reclaim.
-    long_sweep = last["low"] < support and last["close"] > support
-    short_sweep = last["high"] > resistance and last["close"] < resistance
-
-    # Pullback through EMA20 followed by reclaim/rejection.
-    long_reclaim = (
-        prev["close"] <= e20
-        and last["close"] > e20
-        and bull
-    )
-    short_reject = (
-        prev["close"] >= e20
-        and last["close"] < e20
-        and bear
-    )
-
-    # Continuation: previous candle held the EMA and current candle
-    # continues in trend direction.
-    long_cont = (
-        prev["low"] <= e20 * 1.003
-        and last["close"] > prev["high"]
-        and bull
-    )
-    short_cont = (
-        prev["high"] >= e20 * 0.997
-        and last["close"] < prev["low"]
-        and bear
-    )
-
-    trigger = False
-
-    if side == "LONG":
+        breakout = cur.c > recent_high
         if breakout:
             score += 20
-            reasons.append("BREAKOUT")
-            trigger = True
-        if long_sweep:
-            score += 20
-            reasons.append("SWEEP_RECLAIM")
-            trigger = True
-        if long_reclaim:
+            setup.append("BREAKOUT")
+
+        if r >= 50:
             score += 15
-            reasons.append("EMA20_RECLAIM")
-            trigger = True
-        if long_cont:
+            setup.append("RSI_CONFIRMATION")
+
+        if rel_vol >= 1.5:
             score += 15
-            reasons.append("TREND_CONTINUATION")
-            trigger = True
-        if bull:
+            setup.append("HIGH_RELATIVE_VOLUME")
+
+        # Momentum candle quality.
+        if cur.c > cur.o and cur.c > prev.c:
             score += 5
-            reasons.append("BULLISH_CANDLE")
 
-        if 55 <= r <= 72:
-            score += 5
-            reasons.append("RSI_CONFIRMATION")
-        elif r > 78:
-            score -= 10
-            reasons.append("RSI_OVEREXTENDED")
+        if score < MIN_SIGNAL_SCORE or not (e9[-1] > e21[-1] and r >= 50 and breakout):
+            return None
 
-        if relvol >= 1.30:
-            score += 10
-            reasons.append("HIGH_RELATIVE_VOLUME")
-        elif relvol >= 1.05:
-            score += 5
-            reasons.append("VOLUME_CONFIRMATION")
-
-        distance = (last["close"] - e20) / a
-        if distance > MAX_DISTANCE_FROM_EMA20_ATR:
-            score -= 15
-            reasons.append("PRICE_TOO_EXTENDED")
-
-        if not trigger:
-            return None, f"NO_LONG_TRIGGER_SCORE_{score}"
-
-        if score < MIN_SCORE:
-            return None, f"LONG_SCORE_{score}_BELOW_{MIN_SCORE}"
-
-        entry = last["close"]
-
-        structural_sl = min(c["low"] for c in c1[-8:])
-        sl = structural_sl - ATR_STOP_BUFFER * a
-
+        entry = cur.c
+        sl = min(cur.l, entry - 1.0 * a)
         risk = entry - sl
         if risk <= 0:
-            return None, "INVALID_LONG_RISK"
+            return None
+        tp1 = entry + risk * 1.5
+        tp2 = entry + risk * 2.0
+        rr = (tp2 - entry) / risk
 
-        tp1 = entry + 2.0 * risk
-        tp2 = entry + 3.0 * risk
+        return Signal(
+            symbol="", direction="LONG", score=min(score, 100),
+            entry=entry, sl=sl, tp1=tp1, tp2=tp2, rr=rr,
+            rsi=r, rel_volume=rel_vol,
+            context="4H_UPTREND", setup=setup, candle_ts=cur.ts,
+        )
 
-        return {
-            "side": "LONG",
-            "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "rr": 2.0,
-            "score": min(max(score, 0), 100),
-            "rsi": r,
-            "relvol": relvol,
-            "reasons": reasons,
-            "time": last["time"],
-        }, "VALID_LONG"
+    if direction == "SHORT":
+        if e9[-1] < e21[-1]:
+            score += 15
+            setup.append("1H_EMA_ALIGNMENT")
 
-    # SHORT
-    if breakdown:
-        score += 20
-        reasons.append("BREAKDOWN")
-        trigger = True
-    if short_sweep:
-        score += 20
-        reasons.append("SWEEP_REJECTION")
-        trigger = True
-    if short_reject:
-        score += 15
-        reasons.append("EMA20_REJECTION")
-        trigger = True
-    if short_cont:
-        score += 15
-        reasons.append("TREND_CONTINUATION")
-        trigger = True
-    if bear:
-        score += 5
-        reasons.append("BEARISH_CANDLE")
+        breakdown = cur.c < recent_low
+        if breakdown:
+            score += 20
+            setup.append("BREAKDOWN")
 
-    if 28 <= r <= 45:
-        score += 5
-        reasons.append("RSI_CONFIRMATION")
-    elif r < 22:
-        score -= 10
-        reasons.append("RSI_OVEREXTENDED")
+        if r <= 50:
+            score += 15
+            setup.append("RSI_CONFIRMATION")
 
-    if relvol >= 1.30:
-        score += 10
-        reasons.append("HIGH_RELATIVE_VOLUME")
-    elif relvol >= 1.05:
-        score += 5
-        reasons.append("VOLUME_CONFIRMATION")
+        if rel_vol >= 1.5:
+            score += 15
+            setup.append("HIGH_RELATIVE_VOLUME")
 
-    distance = (e20 - last["close"]) / a
-    if distance > MAX_DISTANCE_FROM_EMA20_ATR:
-        score -= 15
-        reasons.append("PRICE_TOO_EXTENDED")
+        if cur.c < cur.o and cur.c < prev.c:
+            score += 5
 
-    if not trigger:
-        return None, f"NO_SHORT_TRIGGER_SCORE_{score}"
+        if score < MIN_SIGNAL_SCORE or not (e9[-1] < e21[-1] and r <= 50 and breakdown):
+            return None
 
-    if score < MIN_SCORE:
-        return None, f"SHORT_SCORE_{score}_BELOW_{MIN_SCORE}"
+        entry = cur.c
+        sl = max(cur.h, entry + 1.0 * a)
+        risk = sl - entry
+        if risk <= 0:
+            return None
+        tp1 = entry - risk * 1.5
+        tp2 = entry - risk * 2.0
+        rr = (entry - tp2) / risk
 
-    entry = last["close"]
+        return Signal(
+            symbol="", direction="SHORT", score=min(score, 100),
+            entry=entry, sl=sl, tp1=tp1, tp2=tp2, rr=rr,
+            rsi=r, rel_volume=rel_vol,
+            context="4H_DOWNTREND", setup=setup, candle_ts=cur.ts,
+        )
 
-    structural_sl = max(c["high"] for c in c1[-8:])
-    sl = structural_sl + ATR_STOP_BUFFER * a
-
-    risk = sl - entry
-    if risk <= 0:
-        return None, "INVALID_SHORT_RISK"
-
-    tp1 = entry - 2.0 * risk
-    tp2 = entry - 3.0 * risk
-
-    return {
-        "side": "SHORT",
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": 2.0,
-        "score": min(max(score, 0), 100),
-        "rsi": r,
-        "relvol": relvol,
-        "reasons": reasons,
-        "time": last["time"],
-    }, "VALID_SHORT"
+    return None
 
 
-def fmt_price(x):
-    if x == 0:
-        return "0"
-    return f"{x:.10g}"
+def scan_symbol(symbol: str) -> Optional[Signal]:
+    try:
+        c4h = fetch_history(symbol, 240, 260)
+        direction, ctx_score, ctx_reason = context_4h(c4h)
+
+        print(f"[SCAN] {symbol} | 4H={direction} | CTX={ctx_score} | {ctx_reason}")
+
+        if direction == "NEUTRAL":
+            print(f"[FILTERED] {symbol} | NO_4H_DIRECTION")
+            return None
+
+        c1h = fetch_history(symbol, 60, 260)
+        sig = trigger_1h(c1h, direction, ctx_score)
+
+        if sig is None:
+            print(f"[FILTERED] {symbol} | NO_{direction}_TRIGGER")
+            return None
+
+        sig.symbol = symbol
+        print(
+            f"[VALID {sig.direction}] {symbol} | score={sig.score} | "
+            f"RR=1:{sig.rr:.1f}"
+        )
+        return sig
+
+    except Exception as exc:
+        print(f"[ERROR] {symbol} | {exc}")
+        return None
 
 
-def telegram_message(symbol, context, signal):
-    dt = datetime.fromtimestamp(signal["time"], tz=timezone.utc)
-    emoji = "🟢" if signal["side"] == "LONG" else "🔴"
-
-    return (
-        f"{emoji} OMPFinex SIGNAL V6\n\n"
-        f"#{symbol}\n"
-        f"Direction: {signal['side']}\n"
-        f"4H: {context['reason']}\n"
-        f"Score: {signal['score']}/100\n\n"
-        f"Entry: {fmt_price(signal['entry'])}\n"
-        f"SL: {fmt_price(signal['sl'])}\n"
-        f"TP1: {fmt_price(signal['tp1'])}\n"
-        f"TP2: {fmt_price(signal['tp2'])}\n"
-        f"R:R: 1:{signal['rr']:.1f}\n\n"
-        f"RSI(1H): {signal['rsi']:.1f}\n"
-        f"Relative Volume: {signal['relvol']:.2f}x\n"
-        f"Setup: {', '.join(signal['reasons'])}\n"
-        f"Candle: {dt.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-        "⚠️ Signal only. No order was placed."
-    )
+def fmt_price(x: float) -> str:
+    if x >= 1000:
+        return f"{x:.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    if x >= 0.01:
+        return f"{x:.6f}"
+    return f"{x:.10f}".rstrip("0").rstrip(".")
 
 
-def send_telegram(text):
-    if not BOT_TOKEN or not CHAT_ID:
+def telegram_send(text: str) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    if not token or not chat_id:
         print("[TELEGRAM] Secrets not configured; message not sent.")
         return False
 
-    r = SESSION.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text},
-        timeout=20,
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = session.post(
+            url,
+            json={"chat_id": chat_id, "text": text},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        print("[TELEGRAM] Message sent.")
+        return True
+    except Exception as exc:
+        print(f"[TELEGRAM] Send failed: {exc}")
+        return False
+
+
+def signal_message(sig: Signal) -> str:
+    icon = "🟢" if sig.direction == "LONG" else "🔴"
+    dt = datetime.fromtimestamp(sig.candle_ts, tz=timezone.utc)
+    return (
+        f"{icon} OMPFinex SIGNAL V7\n"
+        f"#{sig.symbol}\n"
+        f"Direction: {sig.direction}\n"
+        f"4H: {sig.context}\n"
+        f"Score: {sig.score}/100\n"
+        f"Entry: {fmt_price(sig.entry)}\n"
+        f"SL: {fmt_price(sig.sl)}\n"
+        f"TP1: {fmt_price(sig.tp1)}\n"
+        f"TP2: {fmt_price(sig.tp2)}\n"
+        f"R:R: 1:{sig.rr:.1f}\n"
+        f"RSI(1H): {sig.rsi:.1f}\n"
+        f"Relative Volume: {sig.rel_volume:.2f}x\n"
+        f"Setup: {', '.join(sig.setup)}\n"
+        f"Candle: {dt:%Y-%m-%d %H:%M} UTC\n"
+        f"⚠️ Signal only. No order was placed."
     )
-    r.raise_for_status()
-
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram error: {data}")
-
-    return True
 
 
-def main():
+def main() -> None:
     print("=" * 78)
-    print("OMPFinex SIGNAL SCANNER - VERSION 6")
-    print("4H TREND -> 1H TRIGGER | LONG/SHORT ONLY")
+    print("OMPFinex SIGNAL SCANNER - VERSION 7")
+    print("DYNAMIC USDT UNIVERSE -> 4H TREND -> 1H TRIGGER | LONG/SHORT ONLY")
     print("=" * 78)
 
-    valid = []
+    print(f"[DISCOVERY] Target symbols: {TARGET_SYMBOL_COUNT}")
+    symbols = discover_usdt_symbols(TARGET_SYMBOL_COUNT)
 
-    for symbol in SYMBOLS:
-        try:
-            c1 = get_candles(symbol, 60, LOOKBACK_HOURS)
-            c4 = aggregate_4h(c1)
+    if not symbols:
+        print("[FATAL] No USDT symbols discovered.")
+        return
 
-            if len(c1) < 80 or len(c4) < 50:
-                print(f"[SKIP] {symbol} | insufficient closed candles")
-                continue
+    print(f"[DISCOVERY] Found {len(symbols)} candidate USDT symbols.")
+    print("[UNIVERSE] " + ", ".join(symbols))
 
-            context = trend_context(c4)
-            signal, status = build_signal(c1, context)
-
-            print(
-                f"[SCAN] {symbol} | "
-                f"4H={context['side']} | "
-                f"CTX={context['score']} | "
-                f"{context['reason']}"
-            )
-
-            if signal:
-                print(
-                    f"[VALID {signal['side']}] {symbol} | "
-                    f"score={signal['score']} | "
-                    f"RR=1:{signal['rr']:.1f}"
-                )
-                valid.append((symbol, context, signal))
-            else:
-                print(f"[FILTERED] {symbol} | {status}")
-
-        except requests.RequestException as e:
-            print(f"[ERROR] {symbol} | HTTP: {e}")
-        except Exception as e:
-            print(f"[ERROR] {symbol} | {type(e).__name__}: {e}")
+    signals: list[Signal] = []
+    for i, symbol in enumerate(symbols, 1):
+        print(f"\n[{i}/{len(symbols)}] ------------------------------")
+        sig = scan_symbol(symbol)
+        if sig:
+            signals.append(sig)
 
     print("\n" + "=" * 78)
     print("FINAL RESULT")
     print("=" * 78)
 
-    if not valid:
+    if not signals:
         print("NO VALID LONG/SHORT SETUP FOUND")
-        print("NO TELEGRAM MESSAGE WILL BE SENT.")
-        return
+        print("NO TELEGRAM MESSAGE WILL BE SENT")
+    else:
+        # Highest score first. Do not send duplicate alerts for the same symbol.
+        signals.sort(key=lambda s: (-s.score, -s.rr))
+        for sig in signals:
+            print(signal_message(sig))
+            telegram_send(signal_message(sig))
 
-    # One message per valid symbol. No WAIT messages.
-    for symbol, context, signal in valid:
-        text = telegram_message(symbol, context, signal)
-        print("\n" + text)
-
-        try:
-            if send_telegram(text):
-                print(f"[TELEGRAM] SENT | {symbol} | {signal['side']}")
-        except Exception as e:
-            print(f"[TELEGRAM ERROR] {symbol} | {e}")
-
-    print("\nSCAN FINISHED")
+    print("=" * 78)
+    print(f"SCAN FINISHED | symbols={len(symbols)} | signals={len(signals)}")
 
 
 if __name__ == "__main__":
